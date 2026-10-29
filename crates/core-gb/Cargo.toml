@@ -1,0 +1,12 @@
+[package]
+name = "core-gb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+core-common = { path = "../core-common" }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+audio-cpal = { path = "../audio-cpal" }

@@ -1,0 +1,9 @@
+[package]
+name = "audio-cpal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+core-common = { path = "../core-common" }
+cpal.workspace = true
+ringbuf.workspace = true

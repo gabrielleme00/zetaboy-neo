@@ -1,0 +1,208 @@
+use super::{
+    DutyCycle, Envelope, EnvelopeDirection, LengthCounter, PulsePhaseTimer, Sweep, SweepDirection,
+    as_dac_output,
+};
+
+#[derive(Debug, Clone)]
+pub struct PulseChannel {
+    pub channel_enabled: bool,
+    dac_enabled: bool,
+    sweep: Option<Sweep>,
+    timer: PulsePhaseTimer,
+    duty_cycle: DutyCycle,
+    length_counter: LengthCounter,
+    envelope: Envelope,
+    sample_surpressed: bool,
+    just_reloaded: bool,
+}
+
+impl PulseChannel {
+    pub fn new() -> Self {
+        Self {
+            channel_enabled: false,
+            dac_enabled: false,
+            sweep: None,
+            timer: PulsePhaseTimer::new(),
+            duty_cycle: DutyCycle::default(),
+            length_counter: LengthCounter::new(),
+            envelope: Envelope::default(),
+            sample_surpressed: false,
+            just_reloaded: false,
+        }
+    }
+
+    pub fn new_with_sweep() -> Self {
+        Self {
+            channel_enabled: false,
+            dac_enabled: false,
+            sweep: Some(Sweep::new()),
+            timer: PulsePhaseTimer::new(),
+            duty_cycle: DutyCycle::default(),
+            length_counter: LengthCounter::new(),
+            envelope: Envelope::default(),
+            sample_surpressed: false,
+            just_reloaded: false,
+        }
+    }
+
+    pub fn tick(&mut self) {
+        if self.timer.tick() {
+            // After a phase step, clear the flags
+            self.just_reloaded = false;
+            self.sample_surpressed = false;
+        }
+    }
+
+    pub fn clock_sweep(&mut self) {
+        if let Some(ref mut sweep) = self.sweep {
+            if let Some(new_frequency) = sweep.clock() {
+                self.timer.set_frequency(new_frequency);
+            }
+            // Only disable the channel if overflow occurred during sweep
+            if sweep.should_disable_channel() {
+                self.channel_enabled = false;
+            }
+        }
+    }
+
+    pub fn clock_length_counter(&mut self) {
+        self.length_counter.clock(&mut self.channel_enabled);
+    }
+
+    pub fn clock_envelope(&mut self) {
+        self.envelope.clock();
+    }
+
+    fn digital_output(&self) -> f32 {
+        if !self.channel_enabled || !self.dac_enabled {
+            return 0.0; // DAC disabled = 0 output
+        }
+
+        // Suppress output for the first sample after trigger
+        if self.sample_surpressed {
+            return 0.0;
+        }
+
+        let waveform_step = self.duty_cycle.waveform_step(self.timer.get_phase());
+        let volume = self.envelope.volume;
+
+        (waveform_step * volume) as f32
+    }
+
+    pub fn analog_output(&self) -> f32 {
+        as_dac_output(self.digital_output())
+    }
+
+    fn trigger(&mut self) {
+        let was_active = self.channel_enabled;
+        
+        // Enable the channel if DAC is enabled
+        if self.dac_enabled {
+            self.channel_enabled = true;
+        }
+
+        // Reload timer
+        self.timer.trigger();
+        self.just_reloaded = true;
+        
+        // Only suppress the first sample if channel was not previously active
+        self.sample_surpressed = !was_active && self.channel_enabled;
+
+        // Reload length counter if it's 0
+        if self.length_counter.get() == 0 {
+            self.length_counter.trigger();
+        }
+
+        // Reload envelope
+        self.envelope.trigger();
+
+        // Handle sweep for channel 1
+        if let Some(ref mut sweep) = self.sweep {
+            if sweep.trigger(self.timer.get_frequency()) {
+                // Sweep overflow disables the channel
+                self.channel_enabled = false;
+            }
+        }
+    }
+
+    pub fn get_sweep_settings(&self) -> u8 {
+        if let Some(ref sweep) = self.sweep {
+            ((sweep.configured_period & 0x07) << 4)
+                | (match sweep.configured_direction {
+                    SweepDirection::Increase => 0,
+                    SweepDirection::Decrease => 1,
+                } << 3)
+                | (sweep.configured_shift & 0x07)
+        } else {
+            0xFF
+        }
+    }
+
+    pub fn set_sweep_settings(&mut self, value: u8) {
+        if let Some(ref mut sweep) = self.sweep {
+            sweep.configured_period = (value >> 4) & 0x07;
+            sweep.configured_direction = if (value & 0x08) != 0 {
+                SweepDirection::Decrease
+            } else {
+                SweepDirection::Increase
+            };
+            sweep.configured_shift = value & 0x07;
+        }
+    }
+
+    pub fn get_length_settings(&self) -> u8 {
+        (self.duty_cycle as u8) << 6 | (self.length_counter.get() & 0x3F)
+    }
+
+    pub fn set_length_settings(&mut self, value: u8) {
+        self.duty_cycle = DutyCycle::from_bits(value >> 6);
+        let length_load = value & 0x3F;
+        self.length_counter.load(length_load);
+    }
+
+    pub fn get_envelope_settings(&self) -> u8 {
+        (self.envelope.starting_volume << 4)
+            | ((match self.envelope.configured_direction {
+                EnvelopeDirection::Increasing => 1,
+                EnvelopeDirection::Decreasing => 0,
+            }) << 3)
+            | (self.envelope.configured_period & 0x07)
+    }
+
+    pub fn set_envelope_settings(&mut self, value: u8) {
+        self.envelope.starting_volume = (value >> 4) & 0x0F;
+        self.envelope.configured_direction = if (value & 0x08) != 0 {
+            EnvelopeDirection::Increasing
+        } else {
+            EnvelopeDirection::Decreasing
+        };
+        self.envelope.configured_period = value & 0x07;
+        
+        self.dac_enabled = (value & 0xF8) != 0;
+
+        if !self.dac_enabled {
+            self.channel_enabled = false;
+        }
+    }
+
+    pub fn set_period_low_settings(&mut self, value: u8) {
+        self.timer.set_frequency_lsb(value);
+    }
+
+    pub fn get_period_high_control_settings(&self) -> u8 {
+        (if self.length_counter.enabled {
+            1 << 6
+        } else {
+            0
+        }) | (if self.channel_enabled { 1 << 7 } else { 0 })
+            | (self.timer.get_frequency_msb() & 0x07)
+    }
+
+    pub fn set_period_high_control_settings(&mut self, value: u8) {
+        self.timer.set_frequency_msb(value);
+        self.length_counter.enabled = (value & (1 << 6)) != 0;
+        if value & (1 << 7) != 0 {
+            self.trigger();
+        }
+    }
+}

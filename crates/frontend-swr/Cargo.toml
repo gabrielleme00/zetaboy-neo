@@ -1,0 +1,10 @@
+[package]
+name = "frontend-swr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+audio-cpal = { path = "../audio-cpal" }
+core-common = { path = "../core-common" }
+core-gb = { path = "../core-gb" }
+minifb = "0.28.0"
