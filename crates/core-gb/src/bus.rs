@@ -3,7 +3,7 @@ use super::{Apu, Cart, Dma, Interrupt, Joypad, Ppu, Timer, AudioOutput};
 pub struct Bus {
     m_cycles: u32,
     cart: Cart,
-    ppu: Ppu,
+    pub ppu: Ppu,
     apu: Apu,
     wram: Vec<u8>,
     joypad: Joypad,

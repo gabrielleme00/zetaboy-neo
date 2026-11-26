@@ -63,6 +63,10 @@ impl GameBoy {
         self.bus.audio_output.set_audio_sample_rate(sink.sample_rate());
         self.audio_sink = Some(sink);
     }
+
+    pub fn ppu(&self) -> &Ppu {
+        &self.bus.ppu
+    }
 }
 
 impl SystemCore for GameBoy {

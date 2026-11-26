@@ -13,14 +13,14 @@ const STAT_LYC_INT: u8 = 0x40; // LYC=LY select
 const STAT_WRITABLE: u8 = 0x78; // bits 3-6
 
 // LCDC bit masks.
-const LCDC_BG_WINDOW_ENABLE: u8 = 0x01;
-const LCDC_OBJ_ENABLE: u8 = 0x02;
-const LCDC_OBJ_SIZE: u8 = 0x04; // 0 = 8x8, 1 = 8x16
-const LCDC_BG_TILE_MAP: u8 = 0x08;
-const LCDC_TILE_DATA_SELECT: u8 = 0x10;
-const LCDC_WINDOW_ENABLE: u8 = 0x20;
-const LCDC_WINDOW_TILE_MAP: u8 = 0x40;
-const LCDC_LCD_ENABLE: u8 = 0x80;
+const LCDC_BG_WINDOW_ENABLE: u8 = 1 << 0;
+const LCDC_OBJ_ENABLE: u8 = 1 << 1;
+const LCDC_OBJ_SIZE: u8 = 1 << 2;
+const LCDC_BG_TILE_MAP: u8 = 1 << 3;
+const LCDC_TILE_DATA_SELECT: u8 = 1 << 4;
+const LCDC_WINDOW_ENABLE: u8 = 1 << 5;
+const LCDC_WINDOW_TILE_MAP: u8 = 1 << 6;
+const LCDC_LCD_ENABLE: u8 = 1 << 7;
 
 #[derive(Clone, Copy)]
 struct SpriteEntry {
@@ -54,6 +54,8 @@ pub enum PpuMode {
 }
 
 pub struct Ppu {
+    pub vram: [u8; 0x2000],           // Video RAM (8KB)
+    pub oam: [u8; 0xA0],              // Object Attribute Memory (OAM)
     lcdc: u8,                         // 0xFF40 LCD Control
     stat: u8,                         // 0xFF41 LCD Status
     scy: u8,                          // 0xFF42 Scroll Y
@@ -65,8 +67,6 @@ pub struct Ppu {
     obp1: u8,                         // 0xFF49 Object Palette 1
     wy: u8,                           // 0xFF4A Window Y position
     wx: u8,                           // 0xFF4B Window X position (+7)
-    vram: [u8; 0x2000],               // Video RAM (8KB)
-    oam: [u8; 0xA0],                  // Object Attribute Memory (OAM)
     dots: u16,                        // Current dot within scanline (0..456)
     pixel_x: u8,                      // Pixels pushed on current scanline (0..160)
     mode3_delay: u8,                  // Penalty delay before pixel transfer
@@ -81,6 +81,8 @@ pub struct Ppu {
 impl Ppu {
     pub fn new() -> Self {
         Self {
+            vram: [0; 0x2000],
+            oam: [0; 0xA0],
             lcdc: 0,
             stat: PpuMode::OAMSearch as u8,
             scy: 0,
@@ -92,8 +94,6 @@ impl Ppu {
             obp1: 0,
             wy: 0,
             wx: 0,
-            vram: [0; 0x2000],
-            oam: [0; 0xA0],
             dots: 0,
             pixel_x: 0,
             mode3_delay: 12,
@@ -110,12 +110,11 @@ impl Ppu {
         &self.pixels
     }
 
-    pub fn is_lcd_enabled(&self) -> bool {
-        (self.lcdc & LCDC_LCD_ENABLE) != 0
-    }
-
-    fn window_enabled(&self) -> bool {
-        (self.lcdc & LCDC_WINDOW_ENABLE) != 0
+    /// Maps a 2-bit color index (0..=3) through BGP to an ARGB pixel.
+    pub fn bg_shade_color(&self, color_num: u8) -> u32 {
+        let palette = if self.bgp == 0 { 0xE4 } else { self.bgp }; // fallback 11_10_01_00 if uninitialized
+        let mapped = (palette >> ((color_num & 0x03) * 2)) & 0x03;
+        PALETTE[mapped as usize]
     }
 
     fn mode(&self) -> PpuMode {
@@ -359,7 +358,7 @@ impl Ppu {
 
     /// Raw (pre-BGP) 0-3 BG/window color number. 0 when LCDC.0 disables both layers.
     fn bg_color_number(&mut self, x: u8, y: u8) -> u8 {
-        if self.lcdc & LCDC_BG_WINDOW_ENABLE == 0 {
+        if !self.bg_window_enable() {
             return 0;
         }
 
@@ -370,11 +369,7 @@ impl Ppu {
             self.window_drawn_this_scanline = true; // Set latch
 
             let win_x = (x as u16 + 7 - self.wx as u16) as u8;
-            let map_base = if self.lcdc & LCDC_WINDOW_TILE_MAP != 0 {
-                0x9C00
-            } else {
-                0x9800
-            };
+            let map_base = self.window_map_base();
 
             let window_row = if self.wx == 166 {
                 self.window_line.wrapping_add(1)
@@ -385,11 +380,7 @@ impl Ppu {
         } else {
             let world_x = x.wrapping_add(self.scx);
             let world_y = y.wrapping_add(self.scy);
-            let map_base = if self.lcdc & LCDC_BG_TILE_MAP != 0 {
-                0x9C00
-            } else {
-                0x9800
-            };
+            let map_base = self.bg_map_base();
 
             self.tile_pixel_color_index(map_base, world_x, world_y)
         }
@@ -409,12 +400,7 @@ impl Ppu {
 
         // Locate tile data address in VRAM. LCDC.4 selects between the
         // unsigned 0x8000 base and the signed 0x9000 base.
-        let tile_data_addr: u16 = if (self.lcdc & LCDC_TILE_DATA_SELECT) != 0 {
-            0x8000 + (tile_index as u16 * 16)
-        } else {
-            let signed_index = tile_index as i8 as i16;
-            (0x9000i32 + (signed_index * 16) as i32) as u16
-        };
+        let tile_data_addr: u16 = self.get_tile_data_addr(tile_index);
 
         // Fetch the 2 bytes for the current 8-pixel scanline row.
         let row_in_tile = (world_y % 8) as u16;
@@ -431,11 +417,7 @@ impl Ppu {
     /// or the winning sprite is behind a non-zero BG pixel). Transparent pixels
     /// (color 0) let lower-priority sprites show through.
     fn sprite_pixel_at(&self, x: u8, y: u8, bg_num: u8) -> Option<u32> {
-        let height: u8 = if self.lcdc & LCDC_OBJ_SIZE != 0 {
-            16
-        } else {
-            8
-        };
+        let height: u8 = self.obj_size();
 
         for sprite in &self.line_sprites {
             let sx = sprite.x as i16 - 8;
@@ -501,14 +483,10 @@ impl Ppu {
     /// since sort_by is stable).
     fn scan_sprites(&mut self) {
         self.line_sprites.clear();
-        if self.lcdc & LCDC_OBJ_ENABLE == 0 {
+        if !self.obj_enable() {
             return;
         }
-        let height: i16 = if self.lcdc & LCDC_OBJ_SIZE != 0 {
-            16
-        } else {
-            8
-        };
+        let height = self.obj_size() as i16;
         let ly = self.ly as i16;
 
         for i in 0..40 {
@@ -534,6 +512,85 @@ impl Ppu {
         // Approximate mode-3 penalty: ~6 dots per sprite that can appear on screen
         let penalty = self.line_sprites.iter().filter(|s| s.x < 168).count() as u8 * 6;
         self.mode3_delay += penalty; // max 12 + 60, fits in u8
+    }
+}
+
+impl Ppu {
+    // LCDC
+
+    /// Bit 0 of the LCDC register determines whether the background and window are enabled.
+    ///
+    /// Returns true if the background and window are enabled (or are priority over sprites on GBC),
+    /// false otherwise.
+    fn bg_window_enable(&self) -> bool {
+        self.lcdc & LCDC_BG_WINDOW_ENABLE != 0
+    }
+
+    /// Bit 1 of the LCDC register determines whether sprites (objects) are enabled.
+    ///
+    /// Returns early if sprites are disabled.
+    fn obj_enable(&self) -> bool {
+        self.lcdc & LCDC_OBJ_ENABLE != 0
+    }
+
+    /// Bit 2 of the LCDC register determines the current object (sprite) size in pixels.
+    ///
+    /// Returns 8 if the bit is 0, and 16 if the bit is 1.
+    fn obj_size(&self) -> u8 {
+        if self.lcdc & LCDC_OBJ_SIZE != 0 {
+            16
+        } else {
+            8
+        }
+    }
+
+    /// Bit 3 of the LCDC register determines which background tile map is used.
+    ///
+    /// Returns 0x9C00 if the bit is 1, and 0x9800 if the bit is 0.
+    pub fn bg_map_base(&self) -> u16 {
+        if self.lcdc & LCDC_BG_TILE_MAP != 0 {
+            0x9C00
+        } else {
+            0x9800
+        }
+    }
+
+    /// Bit 4 of the LCDC register determines which tile data addressing mode is used.
+    ///
+    /// Returns 0x8000 + (tile_index * 16) if the bit is 1 (unsigned addressing),
+    /// and 0x9000 + (signed tile_index * 16) if the bit is 0 (signed addressing).
+    pub fn get_tile_data_addr(&self, tile_index: u8) -> u16 {
+        if (self.lcdc & LCDC_TILE_DATA_SELECT) != 0 {
+            0x8000 + (tile_index as u16 * 16)
+        } else {
+            let signed_index = tile_index as i8 as i16;
+            (0x9000i32 + (signed_index * 16) as i32) as u16
+        }
+    }
+
+    /// Bit 5 of the LCDC register determines whether the window is enabled.
+    ///
+    /// Returns true if the window is enabled, false otherwise.
+    fn window_enabled(&self) -> bool {
+        (self.lcdc & LCDC_WINDOW_ENABLE) != 0
+    }
+
+    /// Bit 6 of the LCDC register determines which window tile map is used.
+    ///
+    /// Returns 0x9C00 if the bit is 1, and 0x9800 if the bit is 0.
+    pub fn window_map_base(&self) -> u16 {
+        if self.lcdc & LCDC_WINDOW_TILE_MAP != 0 {
+            0x9C00
+        } else {
+            0x9800
+        }
+    }
+
+    /// Bit 7 of the LCDC register determines whether the LCD is enabled.
+    ///
+    /// Returns true if the LCD is enabled, false otherwise.
+    pub fn is_lcd_enabled(&self) -> bool {
+        (self.lcdc & LCDC_LCD_ENABLE) != 0
     }
 }
 
